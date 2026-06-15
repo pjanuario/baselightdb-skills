@@ -1,7 +1,7 @@
 ---
 name: baselight
 license: MIT
-compatibility: Requires Python 3 with the requests package (pip install requests)
+compatibility: Requires Python 3 with requests (pip install requests). MPP pay-per-query path also requires pympp[tempo,mcp] (pip install "pympp[tempo,mcp]").
 description: >
   Use this skill for any data question — prices, trends, rankings, statistics, comparisons,
   or historical numbers. Baselight hosts a large PUBLIC catalog of thousands of queryable
@@ -30,43 +30,43 @@ script. No separate MCP connector activation is required — even if the Baselig
 connector is configured in your environment, the skill uses its own HTTP client and
 does not depend on it.
 
-**Dependencies:** Python 3 with `requests` (install with `pip install requests
---break-system-packages` if missing).
+**Dependencies:** Python 3 with `requests` (install with `pip install requests`).
+The MPP path additionally requires `pympp[tempo,mcp]` (`pip install "pympp[tempo,mcp]"`).
 
-## Getting Started
+## Authentication — Two Paths
 
-If the user hasn't set up Baselight yet:
+The script requires **one** of the following. Both are stored in `~/.baselight/credentials`
+(env vars take precedence).
 
-1. **Sign up** at [baselight.app](https://baselight.app) and create an account.
-2. **Generate an API key**: Click the profile icon in the top-right corner, go to
-   **Account Settings → Integrations**, click **Generate New API Key**, give it a name,
-   and save the key securely.
-3. **Persist the key**: Save it to `~/.baselight/credentials` so it's loaded automatically
-   in every future session. Tell the user to run:
-   ```bash
-   mkdir -p ~/.baselight && echo 'BASELIGHT_API_KEY=<their-key>' >> ~/.baselight/credentials && chmod 600 ~/.baselight/credentials
-   ```
-   The script checks credentials in this order: `BASELIGHT_API_KEY` env var →
-   `~/.baselight/credentials`. The env var is session-only; the file persists.
+### Path A: API Key (full access, no per-query charge)
 
-Full documentation: https://baselight.ai/docs/connecting-to-the-baselight-mcp-server/
+```bash
+mkdir -p ~/.baselight
+echo 'BASELIGHT_API_KEY=<your-key>' >> ~/.baselight/credentials && chmod 600 ~/.baselight/credentials
+```
 
-## CRITICAL: Missing API Key Is a Hard Stop
+Get a key: [baselight.app](https://baselight.app) → Account Settings → Integrations → Generate New API Key.
 
-If the key is not found (neither env var nor credentials file), do NOT silently pivot to
-web search. STOP and ask the user to configure their key. Walk them through the setup:
+### Path B: MPP Wallet (no account needed, pay-per-query)
 
-1. Sign up at [baselight.app](https://baselight.app)
-2. Go to Account Settings → Integrations → Generate New API Key
-3. Save it to `~/.baselight/credentials` (see Getting Started above)
+```bash
+npm i -g mppx && mppx account create   # creates wallet, stores key in macOS Keychain
+mppx account export                    # copy the private key
+mkdir -p ~/.baselight
+echo 'MPPX_PRIVATE_KEY=0x<key>' >> ~/.baselight/credentials && chmod 600 ~/.baselight/credentials
+pip install "pympp[tempo,mcp]"
+```
 
-A missing API key is a misconfiguration, not a data problem. The user installed this
-skill because they want Baselight — don't bypass it due to a fixable setup issue.
+- **Catalog tools** (`ping`, `search_catalog`, `search_tables`, `dataset_metadata`,
+  `dataset_tables`, `table_metadata`) are **free** — no charge triggered.
+- **Query tools** (`query`) cost **~0.01 pathUSD per call** via Tempo.
+- `get_results` is free.
+- Wallet must hold pathUSD on Tempo Testnet Moderato (chain 42431).
 
-**Web search fallback is only acceptable** when the key is configured, you have run
-`search_catalog` or `search_tables` and found no relevant datasets, *and* you are
-confident the empty result reflects the catalog rather than a bad query. A SQL query
-returning zero rows is not grounds for fallback — that's likely a query bug.
+### If neither credential is found
+
+Do NOT silently pivot to web search. STOP and ask the user to configure one of the two
+paths above — this is a fixable setup issue, not a data problem.
 
 ## How This Skill Works
 
@@ -74,8 +74,10 @@ All Baselight operations go through `scripts/baselight.py`. It speaks the MCP pr
 over HTTP using `requests`. Each invocation handles the full handshake (initialize →
 notification → tool call) automatically.
 
-The script loads the API key automatically from `~/.baselight/credentials` or the
-`BASELIGHT_API_KEY` env var — no manual export needed if the credentials file exists.
+The script loads credentials from `~/.baselight/credentials` or env vars
+(`BASELIGHT_API_KEY` / `MPPX_PRIVATE_KEY`). API key is sent as `x-api-key`; when only
+`MPPX_PRIVATE_KEY` is present the script handles MPP payment challenges transparently
+(pympp is imported only when a `-32042` challenge is received).
 
 ## Command Reference
 
@@ -278,10 +280,17 @@ For very large result sets, add aggregation or filters to the SQL instead of pag
 
 ## Error Handling
 
-- **"BASELIGHT_API_KEY is not set"**: This is a misconfiguration. Do NOT fall back to
-  web search. Stop and ask the user to save their key to `~/.baselight/credentials`
-  (see Getting Started). The script will pick it up automatically on the next run.
-- **"No module named requests"**: Install with `pip install requests --break-system-packages`.
+- **"no credentials found"**: Neither `BASELIGHT_API_KEY` nor `MPPX_PRIVATE_KEY` is set.
+  Do NOT fall back to web search. Stop and ask the user to configure one of the two
+  authentication paths (see Authentication section above).
+- **MPP payment required but MPPX_PRIVATE_KEY is not configured**: A billed tool
+  (`query`) was called but no MPP key is set. Either add `MPPX_PRIVATE_KEY` to
+  `~/.baselight/credentials` or switch to API key auth.
+- **MPP wallet balance error**: Check wallet pathUSD balance on Tempo Testnet Moderato.
+  Top up via the Tempo faucet.
+- **"No module named requests"**: Install with `pip install requests`.
+- **"No module named mpp"**: Install with `pip install "pympp[tempo,mcp]"`. Only needed
+  for the MPP path.
 - **"Could not connect"**: Run `ping` to check connectivity. The service may be down.
   Only if the service is genuinely unavailable (not just a missing key) should you let
   the user know and offer alternatives.

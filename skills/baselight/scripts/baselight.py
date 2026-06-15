@@ -11,11 +11,21 @@ Commands:
     query            <sql>
     get_results      <job_id> [--limit N] [--offset N] [--poll]
 
-Credentials (checked in order):
-    1. BASELIGHT_API_KEY environment variable
-    2. ~/.baselight/credentials file  (BASELIGHT_API_KEY=...)
+Credentials — one of the two is required (checked in order: env var → credentials file):
+    BASELIGHT_API_KEY   Baselight account API key (full access, no per-query charge)
+    MPPX_PRIVATE_KEY    EVM private key for MPP pay-per-query (0x-prefixed hex).
+                        Catalog tools are free; query execution costs ~0.01 pathUSD/call.
 
-Generate a key at: https://baselight.app → Account Settings → Integrations
+File: ~/.baselight/credentials
+    BASELIGHT_API_KEY=<key>
+    MPPX_PRIVATE_KEY=0x<hex>
+
+Dependencies:
+    API key path: pip install requests
+    MPP path:     pip install requests "pympp[tempo,mcp]"
+
+Generate an API key at: https://baselight.app → Account Settings → Integrations
+Create an MPP wallet:   npm i -g mppx && mppx account create
 """
 
 import argparse
@@ -25,6 +35,21 @@ import json
 import os
 import sys
 import time
+import csv
+import glob
+import io
+import json
+import os
+import sys
+import time
+
+# If pympp/requests aren't on the system Python, pick them up from the venv
+_venv = os.path.expanduser("~/.baselight/venv")
+_site_pkgs = glob.glob(os.path.join(_venv, "lib", "python*", "site-packages"))
+for _sp in _site_pkgs:
+    if _sp not in sys.path:
+        sys.path.insert(0, _sp)
+
 import requests
 
 MCP_URL = "https://api.baselight.app/mcp"
@@ -34,33 +59,40 @@ CREDENTIALS_FILE = os.path.expanduser("~/.baselight/credentials")
 
 # ── Credentials ───────────────────────────────────────────────────────
 
-def load_api_key() -> str | None:
-    """Load API key from env var, then credentials file."""
-    key = os.environ.get("BASELIGHT_API_KEY")
-    if key:
-        return key
+def load_credentials() -> tuple[str | None, str | None]:
+    """Return (api_key, mpp_private_key). Either may be None.
+
+    Precedence per key: env var wins over credentials file.
+    """
+    api_key = os.environ.get("BASELIGHT_API_KEY")
+    mpp_key = os.environ.get("MPPX_PRIVATE_KEY")
     if os.path.exists(CREDENTIALS_FILE):
         with open(CREDENTIALS_FILE) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("BASELIGHT_API_KEY="):
-                    return line.split("=", 1)[1].strip()
-    return None
+                if line.startswith("BASELIGHT_API_KEY=") and api_key is None:
+                    api_key = line.split("=", 1)[1].strip()
+                elif line.startswith("MPPX_PRIVATE_KEY=") and mpp_key is None:
+                    mpp_key = line.split("=", 1)[1].strip()
+    return api_key, mpp_key
 
 
 # ── MCP Client ────────────────────────────────────────────────────────
 
 class BaselightClient:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str | None = None, mpp_private_key: str | None = None):
         self.api_key = api_key
+        self.mpp_private_key = mpp_private_key
         self.session_id = None
         self.request_id = 0
         self.http = requests.Session()
-        self.http.headers.update({
+        headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            "x-api-key": self.api_key,
-        })
+        }
+        if api_key:
+            headers["x-api-key"] = api_key
+        self.http.headers.update(headers)
 
     def _next_id(self) -> int:
         self.request_id += 1
@@ -120,6 +152,26 @@ class BaselightClient:
         self._post("notifications/initialized", is_notification=True)
         return resp
 
+    def _fulfill_mpp_challenge(self, challenge: dict) -> dict:
+        """Sign a Tempo transaction for the MPP challenge using pympp.
+        Returns the _meta dict: {"org.paymentauth/credential": {...}}
+        """
+        try:
+            import asyncio
+            from mpp.extensions.mcp import MCPChallenge, MCPCredential
+            from mpp.methods.tempo import ChargeIntent, TempoAccount, tempo
+        except ImportError:
+            raise RuntimeError(
+                'pympp[tempo,mcp] is required for MPP payments. '
+                'Install with: pip install "pympp[tempo,mcp]"'
+            )
+        account = TempoAccount.from_key(self.mpp_private_key)
+        mcp_challenge = MCPChallenge.from_dict(challenge)
+        chain_id = (challenge.get("request") or {}).get("methodDetails", {}).get("chainId")
+        method = tempo(account=account, intents={"charge": ChargeIntent()}, chain_id=chain_id)
+        core_cred = asyncio.run(method.create_credential(mcp_challenge.to_core()))
+        return MCPCredential.from_core(core_cred, mcp_challenge).to_meta()
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
         resp = self._post("tools/call", {
             "name": tool_name,
@@ -127,6 +179,35 @@ class BaselightClient:
         })
         if resp is None:
             raise RuntimeError("No response from server")
+
+        # MPP payment required (-32042)
+        error = resp.get("error")
+        if isinstance(error, dict) and error.get("code") == -32042:
+            if not self.mpp_private_key:
+                raise RuntimeError(
+                    "MPP payment required but MPPX_PRIVATE_KEY is not configured.\n"
+                    f"Add it to {CREDENTIALS_FILE} or set the MPPX_PRIVATE_KEY env var.\n"
+                    "Create a wallet: npm i -g mppx && mppx account create"
+                )
+            challenges = error.get("data", {}).get("challenges", [])
+            if not challenges:
+                raise RuntimeError(f"MPP -32042 with no challenges: {error}")
+            credential_meta = self._fulfill_mpp_challenge(challenges[0])
+            resp = self._post("tools/call", {
+                "name": tool_name,
+                "arguments": arguments,
+                "_meta": credential_meta,
+            })
+            if resp is None:
+                raise RuntimeError("No response after MPP payment")
+            if "error" in resp:
+                raise RuntimeError(f"Tool error after MPP payment: {resp['error']}")
+            result = resp.get("result", resp)
+            receipt = (result.get("_meta") or {}).get("org.paymentauth/receipt")
+            if receipt:
+                print(f"# MPP receipt: {json.dumps(receipt)}", file=sys.stderr)
+            return result
+
         if "error" in resp:
             raise RuntimeError(f"Tool error: {resp['error']}")
         return resp.get("result", resp)
@@ -250,14 +331,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    api_key = load_api_key()
-    if not api_key:
-        print("Error: BASELIGHT_API_KEY is not set.", file=sys.stderr)
+    api_key, mpp_key = load_credentials()
+    if not api_key and not mpp_key:
+        print("Error: no credentials found.", file=sys.stderr)
         print(
-            f"Generate one at: https://baselight.app → Account Settings → Integrations\n"
-            f"Then either:\n"
-            f"  export BASELIGHT_API_KEY=<key>   (current session only)\n"
-            f"  echo 'BASELIGHT_API_KEY=<key>' >> {CREDENTIALS_FILE}   (persistent)",
+            f"Add one of the following to {CREDENTIALS_FILE}:\n"
+            f"  BASELIGHT_API_KEY=<key>       # API key (get one at baselight.app)\n"
+            f"  MPPX_PRIVATE_KEY=0x<hex>      # MPP wallet (npm i -g mppx && mppx account create)",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -265,7 +345,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    client = BaselightClient(api_key)
+    client = BaselightClient(api_key=api_key, mpp_private_key=mpp_key)
     try:
         client.initialize()
     except Exception as e:
